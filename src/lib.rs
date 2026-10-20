@@ -23,6 +23,7 @@ mod task;
 mod terminal;
 mod trace;
 mod work;
+mod multivalue;
 
 #[cfg(feature = "jemalloc")]
 #[cfg(not(any(miri, windows, target_arch = "wasm32")))]

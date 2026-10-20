@@ -5,23 +5,6 @@ mod unix {
             libc::isatty(/* stdout */ 1) == 1
         }
     }
-
-    pub fn get_cols() -> Option<usize> {
-        if cfg!(miri) {
-            return None;
-        }
-        unsafe {
-            let mut winsize = std::mem::zeroed::<libc::winsize>();
-            if libc::ioctl(0, libc::TIOCGWINSZ, &mut winsize) < 0 {
-                return None;
-            }
-            if winsize.ws_col < 10 {
-                // https://github.com/evmar/n2/issues/63: ignore too-narrow widths
-                return None;
-            }
-            Some(winsize.ws_col as usize)
-        }
-    }
 }
 
 #[cfg(unix)]
@@ -43,24 +26,6 @@ mod windows {
                 _ = SetConsoleMode(handle, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
             }
             ok
-        }
-    }
-
-    pub fn get_cols() -> Option<usize> {
-        unsafe {
-            let console = GetStdHandle(STD_OUTPUT_HANDLE);
-            if console == INVALID_HANDLE_VALUE {
-                return None;
-            }
-            let mut csbi = ::std::mem::zeroed::<CONSOLE_SCREEN_BUFFER_INFO>();
-            if GetConsoleScreenBufferInfo(console, &mut csbi) == 0 {
-                return None;
-            }
-            if csbi.dwSize.X < 10 {
-                // https://github.com/evmar/n2/issues/63: ignore too-narrow widths
-                return None;
-            }
-            Some(csbi.dwSize.X as usize)
         }
     }
 }

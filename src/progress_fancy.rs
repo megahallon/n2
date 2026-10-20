@@ -2,16 +2,27 @@
 
 use crate::progress::{build_message, Progress};
 use crate::{
-    graph::Build, graph::BuildId, process::Termination, task::TaskResult, terminal,
-    work::BuildState, work::StateCounts,
+    graph::Build, graph::BuildId, process::Termination, task::TaskResult,
+    work::BuildState, work::StateCounts, multivalue::MultiValueGauge
 };
 use std::collections::VecDeque;
-use std::io::Write;
 use std::sync::Arc;
 use std::sync::Condvar;
 use std::sync::Mutex;
-use std::time::Duration;
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+use std::io::Result;
+use std::io::Write;
+
+use crossterm;
+use crossterm::execute;
+use ratatui::Viewport;
+use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::style::Color;
+use ratatui::widgets::{Block, Borders};
+use ratatui::text::{Line, Text, Span};
+use ratatui::{backend::CrosstermBackend, Terminal, TerminalOptions};
+use ratatui_macros::span;
 
 /// Currently running build task, as tracked for progress updates.
 struct Task {
@@ -44,7 +55,7 @@ const UPDATE_DELAY: Duration = std::time::Duration::from_millis(50);
 const TIMEOUT_DELAY: Duration = std::time::Duration::from_millis(500);
 
 impl FancyConsoleProgress {
-    pub fn new(verbose: bool) -> Self {
+    pub fn new(verbose: bool) -> FancyConsoleProgress {
         let dirty_cond = Arc::new(Condvar::new());
         let state = Arc::new(Mutex::new(FancyState {
             done: false,
@@ -55,6 +66,17 @@ impl FancyConsoleProgress {
             tasks: VecDeque::new(),
             verbose,
         }));
+
+	let height = 12;
+	let mut stdout = std::io::stdout();
+	
+	let backend = CrosstermBackend::new(std::io::stdout());
+	let mut terminal = Terminal::with_options(
+            backend,
+            TerminalOptions {
+		viewport: Viewport::Inline(height),
+            },
+	).unwrap();
 
         // Thread to debounce status updates -- waits a bit, then prints after
         // any dirty state.
@@ -71,7 +93,11 @@ impl FancyConsoleProgress {
                         )
                         .unwrap();
                     if state.done {
-                        std::io::stdout().write_all(&state.pending).unwrap();
+                        //std::io::stdout().write_all(&state.pending).unwrap();
+			//crossterm::terminal::disable_raw_mode().unwrap();
+			execute!(stdout,
+				 crossterm::cursor::MoveDown(height)).unwrap();
+			println!("\n");
                         break;
                     }
                 }
@@ -81,7 +107,7 @@ impl FancyConsoleProgress {
                 // can drop the lock here while we sleep.
                 std::thread::sleep(UPDATE_DELAY);
 
-                state_lock.lock().unwrap().print_progress();
+                state_lock.lock().unwrap().print_progress(&mut terminal).unwrap();
             }
         });
 
@@ -192,7 +218,6 @@ impl FancyState {
         if !result.output.ends_with(b"\n") {
             buf.push(b'\n');
         }
-
         self.dirty();
     }
 
@@ -207,186 +232,75 @@ impl FancyState {
         self.dirty(); // let thread print final time
     }
 
-    fn print_progress(&mut self) {
+    fn print_progress(&mut self, terminal:
+		      &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<()> {
         let failed = self.counts.get(BuildState::Failed);
-        let mut buf: &mut Vec<u8> = &mut self.pending;
-        write!(
-            &mut buf,
-            "[{}] {}/{} done, ",
-            progress_bar(&self.counts, 40),
-            self.counts.get(BuildState::Done) + failed,
-            self.counts.total()
-        )
-        .ok();
-        if failed > 0 {
-            write!(&mut buf, "{} failed, ", failed).ok();
-        }
-        write!(
-            &mut buf,
-            "{}/{} running\n",
-            self.tasks.len(),
-            self.counts.get(BuildState::Queued)
-                + self.counts.get(BuildState::Running)
-                + self.counts.get(BuildState::Ready),
-        )
-        .ok();
-        let mut lines = 1;
-
-        let max_cols = terminal::get_cols().unwrap_or(80);
-        let max_tasks = 8;
+	let done = self.counts.get(BuildState::Done);
+	let queued = self.counts.get(BuildState::Queued);
+	let running = self.counts.get(BuildState::Running);
+	let ready = self.counts.get(BuildState::Ready);
+	let total = self.counts.total();
+	let ratio = ((done as f64) / (total as f64))
+	    .clamp(0.0, 1.0);
+	let qratio = ((running as f64) / (total as f64))
+	    .clamp(0.0, 1.0);
+	let fratio = ((failed as f64) / (total as f64))
+	    .clamp(0.0, 1.0);
+	if ratio.is_nan() {
+	    return Ok(());
+	}
+	let max_tasks = 8;
+	let (cols, rows) = crossterm::terminal::size()?;
+	let y = rows.saturating_sub(12);
+	let area = Rect::new(0, y, cols, 12);
         let now = Instant::now();
-        for task in self.tasks.iter().take(max_tasks) {
-            let delta = now.duration_since(task.start).as_secs() as usize;
-            write!(
-                &mut buf,
-                "{}\n",
-                task_message(&task.message, delta, max_cols)
-            )
-            .ok();
-            lines += 1;
-            if let Some(line) = &task.last_line {
-                let max_len = max_cols - 2;
-                write!(&mut buf, "  {}\n", truncate(line, max_len)).ok();
-                lines += 1;
-            }
-        }
+	terminal.draw(|frame| {
+            use Constraint::{Length, Fill};
+	    let block = Block::default().title("N2").borders(Borders::ALL);
+	    let inner = block.inner(area);
+	    frame.render_widget(block, area);
+            let layout = Layout::vertical([Length(1), Length(1), Length(1), Fill(8)]);
+            let [line1, line2, _line3, line4] = inner.layout(&layout);
+	    /*
+	    let gauge = Gauge::default()
+		.style(Modifier::BOLD)
+		.gauge_style(Style::new().blue().on_black())
+	    .ratio(ratio);
 
-        if self.tasks.len() > max_tasks {
-            let remaining = self.tasks.len() - max_tasks;
-            write!(&mut buf, "...and {} more\n", remaining).ok();
-            lines += 1;
-        }
-
-        // Move cursor up to the first printed line, for overprinting.
-        write!(&mut buf, "\x1b[{}A", lines).ok();
-        std::io::stdout().write_all(&buf).unwrap();
-
-        // Set up buf for next print.
-        // If the user hit ctl-c, it may have printed something on the line.
-        // So \r to go to first column first, then clear anything below.
-        buf.clear();
-        buf.extend_from_slice(b"\r\x1b[J");
+	    frame.render_widget(gauge, line1);
+	    */
+	    let mguage = MultiValueGauge::new().use_unicode(true)
+		.add_value(ratio, Color::Blue)
+		.add_value(qratio, Color::Green)
+		.add_value(fratio, Color::Red);
+	    frame.render_widget(mguage, line1);
+	    let done_line = Line::from(
+		format!("Done {} Queued {} Running {} Ready {} Failed {} Total {}",
+			done, queued, running, ready, failed, total));
+	    frame.render_widget(done_line, line2);
+	    let mut messages: Vec<Line> = Vec::with_capacity(max_tasks);
+            for task in self.tasks.iter().take(max_tasks) {
+		let delta = now.duration_since(task.start).as_secs() as usize;
+		let msg = task_message(&task.message, delta);
+		messages.push(msg);
+	    }
+	    let tasks = Text::from(messages);
+	    frame.render_widget(tasks, line4);
+	})?;
 
         self.dirty = false;
+
+	Ok(())
     }
 }
 
 /// Format a task's status message to optionally include how long it has been running
 /// and also to fit within a maximum number of terminal columns.
-fn task_message(message: &str, seconds: usize, max_cols: usize) -> String {
-    let time_note = if seconds > 2 {
-        format!(" ({}s)", seconds)
-    } else {
-        "".into()
-    };
-    let mut out = message.to_owned();
-    if out.len() + time_note.len() >= max_cols {
-        out.truncate(max_cols - time_note.len() - 3);
-        out.push_str("...");
+fn task_message(message: &str, seconds: usize) -> Line<'_> {
+    let mut spans : Vec<Span> = Vec::new();
+    spans.push(span!(Color::Green; message));
+    if seconds > 0 {
+        spans.push(span!(format!(" ({}s)", seconds)))
     }
-    out.push_str(&time_note);
-    out
-}
-
-fn truncate(s: &str, mut max: usize) -> &str {
-    if max >= s.len() {
-        return s;
-    }
-    while !s.is_char_boundary(max) {
-        max -= 1;
-    }
-    &s[..max]
-}
-
-/// Render a StateCounts as an ASCII progress bar.
-fn progress_bar(counts: &StateCounts, bar_size: usize) -> String {
-    let mut bar = String::with_capacity(bar_size);
-    let mut sum: usize = 0;
-    let total = counts.total();
-    if total == 0 {
-        return " ".repeat(bar_size);
-    }
-    for (count, ch) in [
-        (
-            counts.get(BuildState::Done) + counts.get(BuildState::Failed),
-            '=',
-        ),
-        (
-            counts.get(BuildState::Queued)
-                + counts.get(BuildState::Running)
-                + counts.get(BuildState::Ready),
-            '-',
-        ),
-        (counts.get(BuildState::Want), ' '),
-    ] {
-        sum += count;
-        let mut target_size = sum * bar_size / total;
-        if count > 0 && target_size == bar.len() && target_size < bar_size {
-            // Special case: for non-zero count, ensure we always get at least
-            // one tick.
-            target_size += 1;
-        }
-        while bar.len() < target_size {
-            bar.push(ch);
-        }
-    }
-    bar
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn progress_bar_rendering() {
-        let mut counts = StateCounts::default();
-
-        // Don't crash if we show progress before having any tasks.
-        assert_eq!(progress_bar(&counts, 10), "          ");
-
-        counts.add(BuildState::Want, 100);
-        assert_eq!(progress_bar(&counts, 10), "          ");
-
-        // Half want -> ready.
-        counts.add(BuildState::Want, -50);
-        counts.add(BuildState::Ready, 50);
-        assert_eq!(progress_bar(&counts, 10), "-----     ");
-
-        // One ready -> done.
-        counts.add(BuildState::Ready, -1);
-        counts.add(BuildState::Done, 1);
-        assert_eq!(progress_bar(&counts, 10), "=----     ");
-
-        // All but one want -> ready.
-        counts.add(BuildState::Want, -49);
-        counts.add(BuildState::Ready, 49);
-        assert_eq!(progress_bar(&counts, 10), "=-------- ");
-
-        // All want -> ready.
-        counts.add(BuildState::Want, -1);
-        counts.add(BuildState::Ready, 1);
-        assert_eq!(progress_bar(&counts, 10), "=---------");
-    }
-
-    #[test]
-    fn task_rendering() {
-        assert_eq!(task_message("building foo.o", 0, 80), "building foo.o");
-        assert_eq!(task_message("building foo.o", 0, 10), "buildin...");
-        assert_eq!(task_message("building foo.o", 0, 5), "bu...");
-    }
-
-    #[test]
-    fn task_rendering_with_time() {
-        assert_eq!(task_message("building foo.o", 5, 80), "building foo.o (5s)");
-        assert_eq!(task_message("building foo.o", 5, 10), "bu... (5s)");
-    }
-
-    #[test]
-    fn truncate_utf8() {
-        let text = "utf8 progress bar: ━━━━━━━━━━━━";
-        for len in 10..text.len() {
-            // test passes if this doesn't panic
-            truncate(text, len);
-        }
-    }
+    Line::from(spans)
 }

@@ -47,15 +47,6 @@ impl PosixSpawnAttr {
     fn as_ptr(&mut self) -> *mut libc::posix_spawnattr_t {
         &mut self.0
     }
-
-    fn setflags(&mut self, flags: libc::c_short) -> anyhow::Result<()> {
-        unsafe {
-            check_posix_spawn(
-                "posix_spawnattr_setflags",
-                libc::posix_spawnattr_setflags(self.as_ptr(), flags),
-            )
-        }
-    }
 }
 
 impl Drop for PosixSpawnAttr {
